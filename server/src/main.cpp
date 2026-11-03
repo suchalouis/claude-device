@@ -4,10 +4,10 @@
 //                                           réponse de Claude en direct)
 //  Claude Code (hook http) --POST /hook---> Core2 (permission, question, plan)
 //                          <--décision----- (choix touché à l'écran)
-//  pad-usage.py            --POST /usage--> Core2 (contexte, tokens, prix)
+//  statusLine (curl)       --POST /usage--> Core2 (contexte, tokens, prix)
 //
-//  Claude Code envoie lui-même les événements : rien à lancer sur le PC (sauf
-//  pad-usage.py, qui lit le transcript). Pour une demande, le pad garde la
+//  Claude Code envoie lui-même les événements : rien à lancer sur le PC, la
+//  conso vient de la ligne de statut (curl). Pour une demande, le pad garde la
 //  connexion ouverte et répond avec la décision au format des hooks : pas de
 //  clavier simulé, ça marche dans le terminal comme dans l'app de bureau. Les choix se font sur l'écran tactile ; les zones A / B / C
 //  sous l'écran ouvrent les vues Sessions / Conso / Direct.
@@ -91,7 +91,7 @@ constexpr int REPLY_MAX = 6000;  // octets gardés (la fin du message)
 constexpr int REPLY_LINE_H = 20, REPLY_LINES = 6, REPLY_Y = 102;
 
 // Sessions Claude Code vues par le pad (identifiées par session_id), avec
-// leur consommation envoyée par pad-usage.py
+// leur consommation envoyée par la ligne de statut
 struct Session {
   String id, project, model;
   State state = State::Idle;
@@ -655,7 +655,7 @@ static void drawUsage() {
 
   if (!s || !s->hasUsage) {
     canvas.setTextColor(C_MUTED);
-    drawWrapped("Pas encore de données. Elles arrivent après chaque outil et à la fin de chaque réponse.",
+    drawWrapped("Pas encore de données. Elles arrivent avec la ligne de statut de Claude Code.",
                 10, 82, 300, 5, 20);
     return;
   }
@@ -672,7 +672,7 @@ static void drawUsage() {
   canvas.fillRoundRect(10, 99, 300, 10, 5, C_CARD);
   if (k > 0) canvas.fillRoundRect(10, 99, max(10, (int)(300 * min(k, 1.0f))), 10, 5, gauge);
 
-  // Tokens cumulés, en 2 x 2
+  // Tokens du dernier appel, en 2 x 2
   struct { const char* label; uint64_t n; } cells[] = {
     {"Entrée", s->input}, {"Sortie", s->output},
     {"Cache lu", s->cacheRead}, {"Cache écrit", s->cacheWrite},
@@ -848,7 +848,28 @@ static void trackSession(JsonDocument& doc, const String& ev, const String& tool
   else if (ev == "Stop") s->state = State::Done;
 }
 
-// POST /usage : envoyé par pad-usage.py
+// claude-opus-5-5 -> Opus 5.5 (id de modèle de la ligne de statut)
+static String prettyModel(const String& id, const String& fallback) {
+  String m = id;
+  m.replace("[1m]", "");
+  if (!m.startsWith("claude-")) return fallback.length() ? fallback : m;
+  m = m.substring(7);
+  int dash = m.indexOf('-');
+  String name = dash < 0 ? m : m.substring(0, dash);
+  if (name.length()) name.setCharAt(0, toupper(name[0]));
+  String ver;
+  while (dash >= 0) {
+    m = m.substring(dash + 1);
+    dash = m.indexOf('-');
+    String part = dash < 0 ? m : m.substring(0, dash);
+    if (part.length() > 2) break;  // suffixe de date (20251001)
+    ver += (ver.length() ? "." : "") + part;
+  }
+  return ver.length() ? name + " " + ver : name;
+}
+
+// POST /usage : la ligne de statut de Claude Code (statusLine), postée telle
+// quelle par curl : contexte occupé, dernier appel, coût de la session
 static void handleUsage() {
   JsonDocument doc;
   if (deserializeJson(doc, server.arg("plain"))) {
@@ -859,15 +880,17 @@ static void handleUsage() {
   Session* s = findSession(doc["session_id"] | "");
   if (!s) s = sessionFor(doc);  // session déjà connue : on ne touche pas à `seen`
   if (!s) return;
+  JsonObject ctx = doc["context_window"];
+  JsonObject cur = ctx["current_usage"];
   s->hasUsage = true;
-  s->model = doc["model"] | "";
-  s->context = doc["context"] | 0;
-  s->window = doc["window"] | 0;
-  s->input = doc["input"] | (uint64_t)0;
-  s->output = doc["output"] | (uint64_t)0;
-  s->cacheRead = doc["cache_read"] | (uint64_t)0;
-  s->cacheWrite = doc["cache_write"] | (uint64_t)0;
-  s->cost = doc["cost"] | 0.0f;
+  s->model = prettyModel(doc["model"]["id"] | "", doc["model"]["display_name"] | "");
+  s->context = ctx["total_input_tokens"] | 0;
+  s->window = ctx["context_window_size"] | 0;
+  s->input = cur["input_tokens"] | (uint64_t)0;
+  s->output = cur["output_tokens"] | (uint64_t)0;
+  s->cacheRead = cur["cache_read_input_tokens"] | (uint64_t)0;
+  s->cacheWrite = cur["cache_creation_input_tokens"] | (uint64_t)0;
+  s->cost = doc["cost"]["total_cost_usd"] | 0.0f;
   if (view == View::Usage) ui.dirty = true;
 }
 

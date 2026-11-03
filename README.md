@@ -10,14 +10,17 @@ Petit pad posé à côté du clavier :
   validation de plan ;
 - les zones tactiles **A / B / C** sous l'écran ouvrent trois vues :
   **Sessions** (toutes les sessions en cours, leur état et leur dernière
-  activité ; toucher une ligne ouvre sa conso), **Conso** (contexte occupé,
-  tokens, prix équivalent API) et **Direct** (l'état de Claude). Appuyer deux
-  fois sur la même zone, ou attendre 30 s, ramène au direct.
+  activité ; **toucher une ligne la suit** : Direct et Conso n'affichent
+  plus qu'elle, retoucher la ligne revient à la plus récente), **Conso**
+  (contexte occupé, tokens du dernier appel, coût de la session) et
+  **Direct** (l'état de Claude). Appuyer deux fois sur la même zone, ou
+  attendre 30 s, ramène au direct.
 
 Le dépôt a deux parties :
 - **`server/`** : le firmware du pad (M5Stack Core2), à flasher une fois ;
 - **`client/`** : les hooks Claude Code, à installer sur chaque PC dont tu
-  veux suivre les sessions (macOS, Linux, Windows).
+  veux suivre les sessions (macOS, Linux, Windows). Aucun Python : de simples
+  hooks `http`, un `curl` pour la conso, et un installeur `jq` ou PowerShell.
 
 ## Architecture
 
@@ -28,15 +31,12 @@ Après avoir modifié un diagramme ci-dessous : `python3 docs/build-architecture
 flowchart LR
   subgraph PC["Mac / Linux / Windows"]
     CC["Claude Code<br/>terminal · app · IDE<br/>(une ou plusieurs sessions)"]
-    T[("transcript .jsonl")]
     subgraph H["hooks (~/.claude/settings.json)"]
       E["http → /event<br/>tous les événements,<br/>réponse (MessageDisplay)"]
       P["http → /hook<br/>PermissionRequest,<br/>AskUserQuestion, ExitPlanMode"]
-      U["client/pad-usage.py<br/>PostToolUse, Stop<br/>(async)"]
+      U["statusLine<br/>curl → /usage"]
     end
     CC --> E & P & U
-    CC -.écrit.-> T
-    T -.lu par.-> U
   end
 
   subgraph PAD["server/ : M5Stack Core2 (Wi-Fi, port 80)"]
@@ -108,24 +108,27 @@ changer le nom mDNS.
 
 ## 2. Brancher Claude Code (`client/`)
 
-Sur chaque machine, sur le même réseau que le pad. Il faut Python 3 pour
-l'installeur et pour la vue Conso (déjà là sur macOS et Linux ; sous
-Windows, python.org ou Microsoft Store) :
+Sur chaque machine, sur le même réseau que le pad :
 
 ```bash
-python3 client/install.py 192.168.1.169   # macOS / Linux (ou ./client/install.sh)
-py client\install.py 192.168.1.169        # Windows
-python3 client/install.py --uninstall      # pour les retirer
+./client/install.sh 192.168.1.49          # macOS / Linux (demande jq)
+./client/install.sh --uninstall           # pour les retirer
+```
+```powershell
+.\client\install.ps1 192.168.1.49        # Windows (PowerShell, rien à installer)
+.\client\install.ps1 -Uninstall
 ```
 
 Sans adresse, le script prend `http://claude-pad.local`. Sous Windows, donne
-plutôt l'IP : la résolution `.local` n'y est pas toujours fiable.
+plutôt l'IP : la résolution `.local` n'y est pas toujours fiable. Si
+PowerShell refuse le script : `powershell -ExecutionPolicy Bypass -File
+client\install.ps1 192.168.1.49`.
 
 Le script ajoute les hooks du pad dans `~/.claude/settings.json` sans toucher
 au reste (sauvegarde en `.bak`) ; le relancer remplace l'adresse, et il
-remplace aussi les anciens hooks (scripts `pad-event.py` / `pad-prompt.py`,
-`curl`). À la main : fusionne `client/settings.json` en adaptant l'adresse et
-le chemin de `pad-usage.py`.
+remplace aussi les anciens hooks (scripts `pad-*.py`, `curl`). À la main :
+fusionne `client/settings.json` en adaptant l'adresse (sous Windows,
+`curl.exe` à la place de `curl` dans la ligne de statut).
 
 Les hooks :
 - **http → `/event`** (tous les événements) : l'activité pour l'affichage.
@@ -140,15 +143,13 @@ Les hooks :
 - **http → `/hook`** (`PermissionRequest`, et `PreToolUse` pour
   `AskUserQuestion|ExitPlanMode`) : le pad attend le choix fait à l'écran et
   renvoie la décision. `timeout` de 120 s ; le pad rend la main à 90 s.
-- **`pad-usage.py`** (`PostToolUse`, `Stop`, en `async`) relit le transcript
-  de la session et envoie au pad le contexte occupé, les tokens cumulés
-  (sous-agents compris) et le prix au tarif de l'API Anthropic. C'est le seul
-  script : le pad ne peut pas lire le transcript. Sans Python, seule la vue
-  Conso reste vide.
+- **`statusLine`** : une commande `curl` qui poste au pad le JSON que Claude
+  Code fournit à sa ligne de statut (contexte, dernier appel, coût). C'est ce
+  qui alimente la vue Conso ; la ligne de statut elle-même reste vide.
+  Claude Code n'accepte **qu'une** ligne de statut : si tu en as déjà une,
+  l'installeur la garde et la vue Conso reste vide (poste le JSON au pad
+  depuis ton script : `curl -s --data-binary @- http://<pad>/usage`).
 - `SessionEnd` retire la session de la liste.
-
-Sans installeur (pas de Python), colle dans `~/.claude/settings.json` les
-hooks `http` de `client/settings.json` en remplaçant l'adresse.
 
 Test sans Claude :
 ```bash
@@ -172,13 +173,13 @@ curl -X POST http://claude-pad.local/event -H 'Content-Type: application/json' \
   (la précédente retombe sur le menu du PC).
 - Les hooks `http` et `MessageDisplay` demandent une version récente de
   Claude Code.
-- Le pad montre la réponse de la dernière session active : deux sessions qui
-  répondent en même temps s'alternent à l'écran.
+- Les événements d'une session non suivie ne font que biper ; ses demandes
+  (permission, question, plan) s'affichent quand même.
 - Pendant une demande de permission, la commande reste affichée : c'est ce
   qu'on autorise.
-- Le prix est un **équivalent API** (tarifs codés dans `pad-usage.py`) : avec
-  un abonnement Pro / Max, ce n'est pas ce que tu paies. Le contexte suppose
-  une fenêtre de 1 M tokens (200 k pour Haiku 4.5).
+- Le coût est celui que calcule Claude Code (tarif catalogue de l'API) : avec
+  un abonnement Pro / Max, ce n'est pas ce que tu paies. Les tokens affichés
+  sont ceux du dernier appel, pas un cumul.
 - Le pad oublie les sessions au redémarrage, et celles sans nouvelles depuis 12 h.
 - Questions : 4 au maximum, 4 options chacune (la réponse libre « Other »
   n'est pas proposée sur le pad).
