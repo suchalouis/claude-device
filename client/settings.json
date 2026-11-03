@@ -1,0 +1,29 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {"hooks": [{"type": "command", "command": "python3 /chemin/vers/claude-pad/client/pad-event.py --pad http://claude-pad.local"}]}
+    ],
+    "UserPromptSubmit": [
+      {"hooks": [{"type": "command", "command": "python3 /chemin/vers/claude-pad/client/pad-event.py --pad http://claude-pad.local"}]}
+    ],
+    "PreToolUse": [
+      {"matcher": "*", "hooks": [{"type": "command", "command": "python3 /chemin/vers/claude-pad/client/pad-event.py --pad http://claude-pad.local"}]},
+      {"matcher": "AskUserQuestion|ExitPlanMode", "hooks": [{"type": "command", "command": "python3 /chemin/vers/claude-pad/client/pad-prompt.py --pad http://claude-pad.local", "timeout": 120}]}
+    ],
+    "PostToolUse": [
+      {"matcher": "*", "hooks": [{"type": "command", "command": "python3 /chemin/vers/claude-pad/client/pad-event.py --pad http://claude-pad.local"}, {"type": "command", "command": "python3 /chemin/vers/claude-pad/client/pad-usage.py --pad http://claude-pad.local"}]}
+    ],
+    "PermissionRequest": [
+      {"matcher": "*", "hooks": [{"type": "command", "command": "python3 /chemin/vers/claude-pad/client/pad-prompt.py --pad http://claude-pad.local", "timeout": 120}]}
+    ],
+    "Notification": [
+      {"hooks": [{"type": "command", "command": "python3 /chemin/vers/claude-pad/client/pad-event.py --pad http://claude-pad.local"}]}
+    ],
+    "Stop": [
+      {"hooks": [{"type": "command", "command": "python3 /chemin/vers/claude-pad/client/pad-event.py --pad http://claude-pad.local"}, {"type": "command", "command": "python3 /chemin/vers/claude-pad/client/pad-usage.py --pad http://claude-pad.local"}]}
+    ],
+    "SessionEnd": [
+      {"hooks": [{"type": "command", "command": "python3 /chemin/vers/claude-pad/client/pad-event.py --pad http://claude-pad.local"}]}
+    ]
+  }
+}
