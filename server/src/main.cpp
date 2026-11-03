@@ -76,29 +76,6 @@ uint32_t promptSeq = 0;
 constexpr uint32_t PROMPT_TIMEOUT_MS = 90000;  // ensuite : menu du PC
 constexpr const char* DENY_REASON = "Refusé depuis le Claude Pad";
 
-// Sessions Claude Code vues par le pad (identifiées par session_id), avec
-// leur consommation envoyée par pad-usage.py
-struct Session {
-  String id, project, model;
-  State state = State::Idle;
-  uint32_t seen = 0;  // millis du dernier événement
-  bool hasUsage = false;
-  uint32_t context = 0, window = 0;
-  uint64_t input = 0, output = 0, cacheRead = 0, cacheWrite = 0;
-  float cost = 0;
-};
-constexpr int MAX_SESSIONS = 8;
-constexpr uint32_t SESSION_STALE_MS = 12UL * 3600 * 1000;  // oubliée après 12 h sans nouvelles
-Session sessions[MAX_SESSIONS];
-String lastSessionId;  // session du dernier événement
-
-// Vues : Direct (état de Claude), Sessions, Conso (de la session `focusId`)
-enum class View { Live, Sessions, Usage };
-View view = View::Live;
-uint32_t viewSince = 0;
-String focusId;
-constexpr uint32_t VIEW_TIMEOUT_MS = 30000;  // retour au direct
-
 // Réponse de Claude en cours d'affichage (hook MessageDisplay, par paquets
 // de lignes). Les blocs de code sont remplacés par « [code] ».
 struct Reply {
@@ -109,9 +86,52 @@ struct Reply {
   bool wrapped = false;        // `lines` à jour
   int scroll = 0;              // lignes remontées depuis le bas (0 : suit le direct)
   int count = 0;               // nombre de lignes au dernier affichage
-} reply;
+};
 constexpr int REPLY_MAX = 6000;  // octets gardés (la fin du message)
 constexpr int REPLY_LINE_H = 20, REPLY_LINES = 6, REPLY_Y = 102;
+
+// Sessions Claude Code vues par le pad (identifiées par session_id), avec
+// leur consommation envoyée par pad-usage.py
+struct Session {
+  String id, project, model;
+  State state = State::Idle;
+  uint32_t seen = 0;  // millis du dernier événement
+  bool hasUsage = false;
+  uint32_t context = 0, window = 0;
+  uint64_t input = 0, output = 0, cacheRead = 0, cacheWrite = 0;
+  float cost = 0;
+  String tool;   // dernier outil lancé
+  Reply reply;   // sa réponse en direct
+};
+constexpr int MAX_SESSIONS = 8;
+constexpr uint32_t SESSION_STALE_MS = 12UL * 3600 * 1000;  // oubliée après 12 h sans nouvelles
+Session sessions[MAX_SESSIONS];
+String lastSessionId;  // session du dernier événement
+
+// Vues : Direct (état de Claude), Sessions, Conso. Direct et Conso montrent
+// la session choisie dans la liste (`focusId`), à défaut la plus récente.
+enum class View { Live, Sessions, Usage };
+View view = View::Live;
+uint32_t viewSince = 0;
+String focusId;
+constexpr uint32_t VIEW_TIMEOUT_MS = 30000;  // retour au direct
+
+static Session* findSession(const String& id);
+static Reply noReply;
+
+static Session* shownSession() {
+  Session* s = focusId.length() ? findSession(focusId) : nullptr;
+  if (!s) {
+    focusId = "";  // session finie : on suit de nouveau la plus récente
+    s = findSession(lastSessionId);
+  }
+  return s;
+}
+
+static Reply& shownReply() {
+  Session* s = shownSession();
+  return s ? s->reply : noReply;
+}
 
 uint32_t vibrateUntil = 0;
 bool lastWifiConnected = false;
@@ -432,6 +452,7 @@ static void wrapLines(const String& text, int w, std::vector<String>& out) {
 // Lignes de la réponse : la fin par défaut (la suite arrive en bas, comme un
 // terminal), plus haut si on a fait glisser le doigt dessus
 static void drawReply(int y, int maxLines) {
+  Reply& reply = shownReply();
   canvas.setFont(F_TEXT);
   if (!reply.wrapped) {
     wrapLines(reply.text, 292, reply.lines);
@@ -462,7 +483,7 @@ static void drawReply(int y, int maxLines) {
 
 // Ajoute un paquet de lignes à la réponse : enlève le Markdown, remplace les
 // blocs de code par « [code] », ne garde que la fin.
-static void appendReply(const String& msgId, const String& delta) {
+static void appendReply(Reply& reply, const String& msgId, const String& delta) {
   if (msgId != reply.msgId) {
     reply.msgId = msgId;
     reply.text = "";
@@ -498,6 +519,7 @@ static void appendReply(const String& msgId, const String& delta) {
 }
 
 static bool replyOnScreen() {
+  Reply& reply = shownReply();
   return view == View::Live && ui.state != State::Waiting && reply.text.length();
 }
 
@@ -603,6 +625,7 @@ static void drawSessions() {
     int y = SESSION_ROW_Y + i * SESSION_ROW_H;
     canvas.fillRoundRect(8, y, 304, SESSION_ROW_H - 4, 6, C_CARD);
     if (s.state == State::Waiting) canvas.drawRoundRect(8, y, 304, SESSION_ROW_H - 4, 6, t.accent);
+    if (s.id == focusId) canvas.drawRoundRect(8, y, 304, SESSION_ROW_H - 4, 6, C_TEXT);
     canvas.fillCircle(21, y + 13, 5, t.accent);
 
     String right = String(t.label) + " · " + ago(now - s.seen);
@@ -625,7 +648,7 @@ static void drawSessions() {
 }
 
 static void drawUsage() {
-  Session* s = findSession(focusId.length() ? focusId : lastSessionId);
+  Session* s = shownSession();
   drawViewHeader("CONSO", s ? s->project : String());
   canvas.setFont(F_TEXT);
   canvas.setTextDatum(top_left);
@@ -817,9 +840,10 @@ static void trackSession(JsonDocument& doc, const String& ev, const String& tool
   if (ev == "SessionStart") s->state = State::Idle;
   else if (ev == "UserPromptSubmit" || ev == "PostToolUse" || ev == "MessageDisplay") s->state = State::Thinking;
   else if (ev == "PermissionRequest") s->state = State::Waiting;
-  else if (ev == "PreToolUse")
+  else if (ev == "PreToolUse") {
+    s->tool = tool;
     s->state = tool == "AskUserQuestion" || tool == "ExitPlanMode" ? State::Waiting : State::Working;
-  else if (ev == "Notification")
+  } else if (ev == "Notification")
     s->state = String(doc["notification_type"] | "") == "idle_prompt" ? State::Done : State::Waiting;
   else if (ev == "Stop") s->state = State::Done;
 }
@@ -898,9 +922,26 @@ static void finishHeld(const String& body) {
   held.event.clear();
 }
 
+// Réaffiche l'état de la session choisie (après une demande venue d'une autre)
+static void loadFocus() {
+  Session* s = shownSession();
+  if (!s || ui.state == State::Waiting) return;
+  ui.project = s->project;
+  ui.state = s->state == State::Waiting ? State::Done : s->state;
+  ui.title = s->state == State::Working ? s->tool
+           : s->state == State::Thinking ? String("Claude réfléchit...")
+           : s->state == State::Done ? String("Réponse terminée")
+           : s->state == State::Waiting ? String("Réponds sur le PC") : String("En veille");
+  ui.detail = "";
+  ui.since = millis();
+  ui.dirty = true;
+}
+
 static void resolve(const char* decision, const String& summary) {
+  bool other = focusId.length() && focusId != String(held.event["session_id"] | "");
   finishHeld(hookOutput(decision));
   buzz(40);
+  if (other) { setState(State::Idle, ""); return loadFocus(); }
   if (strcmp(decision, "deny") == 0) setState(State::Idle, "Refusé");
   else setState(State::Working, ask.kind == Ask::Permission ? "Accepté" : "Réponse envoyée", summary);
 }
@@ -947,6 +988,7 @@ static void checkHeld() {
   bool late = millis() - held.since > PROMPT_TIMEOUT_MS;
   if (!gone && !late) return;
   finishHeld("");
+  if (ui.state == State::Waiting && ask.id.length() && focusId.length() && !findSession(focusId)) focusId = "";
   if (ui.state == State::Waiting && ask.id.length())
     setState(State::Idle, late ? "Délai dépassé" : "Répondu sur le PC", late ? "Réponds sur le PC." : "");
 }
@@ -965,9 +1007,16 @@ static void handleEvent() {
   trackSession(doc, ev, tool);
   if (ev == "SessionEnd") return;
 
+  // Chaque session garde sa réponse ; l'écran ne suit que la session choisie
+  String sid = doc["session_id"] | "";
+  Session* sess = findSession(sid);
+  if (ev == "UserPromptSubmit" && sess) sess->reply = Reply();  // nouveau tour
+  bool shown = !focusId.length() || sid == focusId || !findSession(focusId);
+
   // Réponse de Claude, ligne par ligne
   if (ev == "MessageDisplay") {
-    appendReply(doc["message_id"] | "", doc["delta"] | "");
+    if (sess) appendReply(sess->reply, doc["message_id"] | "", doc["delta"] | "");
+    if (!shown) return;
     wake();
     if (ui.state != State::Waiting) {
       String cwd = doc["cwd"] | "";
@@ -980,6 +1029,12 @@ static void handleEvent() {
   // Les demandes passent par /hook, pas par ici
   if (ev == "PermissionRequest") return;
   if (ev == "PreToolUse" && (tool == "AskUserQuestion" || tool == "ExitPlanMode")) return;
+
+  // Autre session que celle choisie : seulement un bip quand elle a fini
+  if (!shown) {
+    if (ev == "Stop" || (ev == "Notification" && !(ui.state == State::Waiting && ask.id.length()))) buzz(120);
+    return;
+  }
 
   // Une demande est à l'écran : on ne la remplace que si elle est close
   // (outil terminé, réponse finie, nouveau message), pas pour l'activité
@@ -1003,7 +1058,6 @@ static void handleEvent() {
     setState(State::Idle, "Session démarrée");
   } else if (ev == "UserPromptSubmit") {
     String prompt = doc["prompt"] | "";
-    reply = Reply();  // nouveau tour : la réponse précédente s'efface
     setState(State::Thinking, "Claude réfléchit...", prompt);
   } else if (ev == "PostToolUse") {
     setState(State::Thinking, "Claude réfléchit...");
@@ -1092,7 +1146,6 @@ static void choose(int i) {
 
 static void showView(View v) {
   view = view == v ? View::Live : v;  // même zone une 2e fois : retour au direct
-  if (view == View::Usage && v == View::Usage) focusId = "";  // session la plus récente
   viewSince = millis();
   ui.dirty = true;
   buzz(15);
@@ -1110,6 +1163,7 @@ static void handleTouch() {
     int lines = drag / REPLY_LINE_H;
     if (lines) {
       drag -= lines * REPLY_LINE_H;
+      Reply& reply = shownReply();
       int before = reply.scroll;
       reply.scroll = max(0, reply.scroll + lines);  // plafonné au dessin
       if (reply.scroll != before) ui.dirty = true;
@@ -1130,14 +1184,19 @@ static void handleTouch() {
     return showView(zones[constrain(touch.x / 107, 0, 2)]);
   }
 
-  // Liste des sessions : une ligne touchée ouvre sa conso
+  // Liste des sessions : une ligne touchée devient la session suivie (direct, conso)
   if (view == View::Sessions) {
     Session* list[MAX_SESSIONS];
     int n = sortedSessions(list);
     int i = (touch.y - SESSION_ROW_Y) / SESSION_ROW_H;
     if (touch.y >= SESSION_ROW_Y && i < n && i < SESSION_ROWS) {
-      focusId = list[i]->id;
-      view = View::Usage;
+      if (focusId == list[i]->id) {
+        focusId = "";  // retoucher la session choisie : retour à la plus récente
+      } else {
+        focusId = list[i]->id;
+        view = View::Usage;
+      }
+      loadFocus();
       viewSince = millis();
       ui.dirty = true;
       buzz(15);
