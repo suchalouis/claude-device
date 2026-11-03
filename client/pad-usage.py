@@ -6,8 +6,8 @@ Lit le transcript (transcript_path) et calcule :
   - les tokens cumulés (entrée, sortie, cache lu, cache écrit),
   - le prix équivalent API (sous-agents compris).
 
-Branché sur Stop, UserPromptSubmit, PostToolUse... Le script rend la main
-tout de suite et fait le calcul en arrière-plan : il ne ralentit jamais Claude.
+Branché sur PostToolUse et Stop, en hook « async » : Claude Code le lance
+en arrière-plan, il ne ralentit jamais Claude.
 
 Adresse du pad : --pad URL, sinon CLAUDE_PAD_URL, sinon http://claude-pad.local
 """
@@ -15,7 +15,6 @@ Adresse du pad : --pad URL, sinon CLAUDE_PAD_URL, sinon http://claude-pad.local
 import glob
 import json
 import os
-import subprocess
 import sys
 import urllib.request
 
@@ -135,29 +134,12 @@ def send(session_id, cwd, path):
 
 
 def main():
-    # Processus détaché lancé ci-dessous : fait le calcul
-    if "--worker" in sys.argv:
-        i = sys.argv.index("--worker")
-        return send(*sys.argv[i + 1:i + 4])
-
     try:
         event = json.load(sys.stdin)
     except Exception:
         return
-    path = event.get("transcript_path")
-    if not path:
-        return
-
-    # Relance le script en arrière-plan et rend la main à Claude Code tout de
-    # suite (pas de os.fork : il n'existe pas sous Windows)
-    if os.name == "nt":
-        opts = {"creationflags": subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP}
-    else:
-        opts = {"start_new_session": True}
-    subprocess.Popen([sys.executable, os.path.abspath(__file__), "--pad", PAD, "--worker",
-                      event.get("session_id", ""), event.get("cwd", ""), path],
-                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                     stderr=subprocess.DEVNULL, close_fds=True, **opts)
+    if event.get("transcript_path"):
+        send(event.get("session_id", ""), event.get("cwd", ""), event["transcript_path"])
 
 
 if __name__ == "__main__":

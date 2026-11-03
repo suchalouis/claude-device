@@ -9,10 +9,10 @@
   subgraph PC[&quot;Mac / Linux / Windows&quot;]
     CC[&quot;Claude Code&lt;br/&gt;terminal · app · IDE&lt;br/&gt;(une ou plusieurs sessions)&quot;]
     T[(&quot;transcript .jsonl&quot;)]
-    subgraph H[&quot;client/ : hooks (~/.claude/settings.json)&quot;]
-      E[&quot;pad-event.py&lt;br/&gt;tous les événements&quot;]
-      P[&quot;pad-prompt.py&lt;br/&gt;PermissionRequest,&lt;br/&gt;AskUserQuestion, ExitPlanMode&quot;]
-      U[&quot;pad-usage.py&lt;br/&gt;PostToolUse, Stop&lt;br/&gt;(en arrière-plan)&quot;]
+    subgraph H[&quot;hooks (~/.claude/settings.json)&quot;]
+      E[&quot;http → /event&lt;br/&gt;tous les événements,&lt;br/&gt;réponse (MessageDisplay)&quot;]
+      P[&quot;http → /hook&lt;br/&gt;PermissionRequest,&lt;br/&gt;AskUserQuestion, ExitPlanMode&quot;]
+      U[&quot;client/pad-usage.py&lt;br/&gt;PostToolUse, Stop&lt;br/&gt;(async)&quot;]
     end
     CC --&gt; E &amp; P &amp; U
     CC -.écrit.-&gt; T
@@ -29,27 +29,19 @@
   end
 
   E -- &quot;POST /event&quot; --&gt; W
-  P -- &quot;POST /prompt&quot; --&gt; W
-  P -- &quot;GET /answer (attente)&quot; --&gt; W
+  P -- &quot;POST /hook (connexion gardée ouverte)&quot; --&gt; W
   U -- &quot;POST /usage&quot; --&gt; W
-  P -. &quot;décision / réponses&quot; .-&gt; CC
+  W -. &quot;décision / réponses&quot; .-&gt; CC
 </pre><h2>Une demande de Claude, de bout en bout</h2><pre class="mermaid">sequenceDiagram
   participant CC as Claude Code
-  participant P as pad-prompt.py
   participant Pad as Core2
   actor Toi
-  CC-&gt;&gt;P: hook (JSON : outil, question, plan...)
-  P-&gt;&gt;Pad: POST /prompt?id=...
+  CC-&gt;&gt;Pad: hook http : POST /hook (JSON : outil, question, plan...)
   Pad--&gt;&gt;Toi: vibre, bipe, affiche les choix
-  loop toutes les 0,3 s (90 s max)
-    P-&gt;&gt;Pad: GET /answer?id=...
-    Pad--&gt;&gt;P: 202 en attente
-  end
+  Note over CC,Pad: la connexion reste ouverte (90 s max)
   Toi-&gt;&gt;Pad: touche un choix
-  P-&gt;&gt;Pad: GET /answer?id=...
-  Pad--&gt;&gt;P: 200 {&quot;decision&quot;: &quot;allow&quot;, &quot;answers&quot;: [...]}
-  P--&gt;&gt;CC: allow / deny / réponses
-  Note over P,CC: sans réponse : POST /cancel,&lt;br/&gt;le menu du PC reprend la main
+  Pad--&gt;&gt;CC: 200 {&quot;hookSpecificOutput&quot;: allow / deny / réponses}
+  Note over CC,Pad: sans réponse, ou réponse donnée sur le PC :&lt;br/&gt;corps vide, le menu du PC reprend la main
 </pre>
 <script type="module">
 import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11.4.1/dist/mermaid.esm.min.mjs";

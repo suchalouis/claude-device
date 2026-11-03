@@ -1,13 +1,15 @@
 // Claude Pad — M5Stack Core2
 //
-//  Claude Code hooks --HTTP POST /event--> Core2 (affichage + vibration)
-//  pad-prompt.py     --POST /prompt-------> Core2 (permission, question, plan)
-//                    <--GET  /answer------- Core2 (choix touché à l'écran)
-//  pad-usage.py      --POST /usage--------> Core2 (contexte, tokens, prix)
+//  Claude Code (hook http) --POST /event--> Core2 (affichage + vibration,
+//                                           réponse de Claude en direct)
+//  Claude Code (hook http) --POST /hook---> Core2 (permission, question, plan)
+//                          <--décision----- (choix touché à l'écran)
+//  pad-usage.py            --POST /usage--> Core2 (contexte, tokens, prix)
 //
-//  Le script de hook attend la réponse du pad et la renvoie directement à
-//  Claude Code : pas de clavier simulé, ça marche dans le terminal comme dans
-//  l'app de bureau. Les choix se font sur l'écran tactile ; les zones A / B / C
+//  Claude Code envoie lui-même les événements : rien à lancer sur le PC (sauf
+//  pad-usage.py, qui lit le transcript). Pour une demande, le pad garde la
+//  connexion ouverte et répond avec la décision au format des hooks : pas de
+//  clavier simulé, ça marche dans le terminal comme dans l'app de bureau. Les choix se font sur l'écran tactile ; les zones A / B / C
 //  sous l'écran ouvrent les vues Sessions / Conso / Direct.
 //
 //  Wi-Fi : réglé depuis un téléphone. Sans réseau enregistré (ou s'il ne
@@ -22,6 +24,7 @@
 #include <DNSServer.h>
 #include <Preferences.h>
 #include <algorithm>
+#include <vector>
 
 // Facultatif : réseau par défaut tant qu'aucun n'a été choisi sur le pad
 #if __has_include("secrets.h")
@@ -51,9 +54,8 @@ WebServer server(80);
 String lastTool;  // dernier outil lancé, affiché quand Claude attend une permission
 String lastWhat;  // sa commande / son fichier
 
-// Demande en cours, identifiée par l'id que lui donne pad-prompt.py.
-// Le choix touché à l'écran est mis de côté dans `done` jusqu'à ce que le
-// script vienne le chercher sur GET /answer.
+// Demande en cours (permission, question, plan) et ses choix à l'écran.
+// `id` change à chaque demande ; vide quand rien n'attend de réponse.
 enum class Ask { None, Permission, Question, Plan, Other };
 enum class Act { Allow, Always, Deny, Pick, Toggle, Submit };
 struct Choice { String label; Act act; bool on; };  // on : case cochée (choix multiple)
@@ -67,7 +69,12 @@ struct Prompt {
   String answers[4];       // une réponse par question
 } ask;
 
-struct Done { String id, json; } done;
+// Demande en attente : la connexion du hook reste ouverte jusqu'au choix
+// à l'écran (Claude Code attend la réponse), ou jusqu'à l'abandon.
+struct Held { WiFiClient client; JsonDocument event; uint32_t since = 0; } held;
+uint32_t promptSeq = 0;
+constexpr uint32_t PROMPT_TIMEOUT_MS = 90000;  // ensuite : menu du PC
+constexpr const char* DENY_REASON = "Refusé depuis le Claude Pad";
 
 // Sessions Claude Code vues par le pad (identifiées par session_id), avec
 // leur consommation envoyée par pad-usage.py
@@ -91,6 +98,20 @@ View view = View::Live;
 uint32_t viewSince = 0;
 String focusId;
 constexpr uint32_t VIEW_TIMEOUT_MS = 30000;  // retour au direct
+
+// Réponse de Claude en cours d'affichage (hook MessageDisplay, par paquets
+// de lignes). Les blocs de code sont remplacés par « [code] ».
+struct Reply {
+  String msgId;
+  String text;                 // fin du message, nettoyée du Markdown
+  bool inFence = false;        // dans un bloc ``` ... ```
+  std::vector<String> lines;   // `text` coupé à la largeur de l'écran
+  bool wrapped = false;        // `lines` à jour
+  int scroll = 0;              // lignes remontées depuis le bas (0 : suit le direct)
+  int count = 0;               // nombre de lignes au dernier affichage
+} reply;
+constexpr int REPLY_MAX = 6000;  // octets gardés (la fin du message)
+constexpr int REPLY_LINE_H = 20, REPLY_LINES = 6, REPLY_Y = 102;
 
 uint32_t vibrateUntil = 0;
 bool lastWifiConnected = false;
@@ -278,7 +299,7 @@ static void drawStatusBar() {
   canvas.drawFastHLine(0, 24, 320, C_DIM);
 }
 
-// --- bandeau d'état : pastille animée + libellé + chrono
+// --- bandeau d'état : pastille animée + libellé
 
 static void drawStateHeader(const Theme& t, uint32_t now) {
   bool waiting = ui.state == State::Waiting;
@@ -327,14 +348,6 @@ static void drawStateHeader(const Theme& t, uint32_t now) {
   canvas.setTextDatum(middle_left);
   canvas.setTextColor(waiting ? TFT_WHITE : C_TEXT);
   canvas.drawString(t.label, 46, cy + 1);
-
-  uint32_t s = (now - ui.since) / 1000;
-  char buf[16];
-  snprintf(buf, sizeof(buf), "%02lu:%02lu", (unsigned long)(s / 60), (unsigned long)(s % 60));
-  canvas.setFont(F_TEXT);
-  canvas.setTextDatum(middle_right);
-  canvas.setTextColor(waiting ? TFT_WHITE : C_MUTED);
-  canvas.drawString(buf, 302, cy + 1);
 }
 
 // --- menus de Claude : une ligne tactile par choix, « Non » en dernier
@@ -389,6 +402,105 @@ static void drawMenu(const Theme& t) {
 
 // --- contenu : titre + détail (dans une carte « code » quand c'est une commande)
 
+// Coupe `text` en lignes de `w` pixels au plus (aux espaces de préférence)
+static void wrapLines(const String& text, int w, std::vector<String>& out) {
+  out.clear();
+  int pos = 0, len = text.length();
+  while (pos <= len) {
+    int nl = text.indexOf('\n', pos);
+    String para = text.substring(pos, nl < 0 ? len : nl);
+    pos = nl < 0 ? len + 1 : nl + 1;
+    if (!para.length()) { out.push_back(""); continue; }
+    while (para.length()) {
+      int fit = 0, lastSpace = -1;
+      for (int i = 0; i < (int)para.length();) {
+        int n = nextChar(para, i);
+        if (canvas.textWidth(para.substring(0, n)) > w) break;
+        if (para[i] == ' ') lastSpace = i;
+        fit = i = n;
+      }
+      if (!fit) fit = nextChar(para, 0);
+      int cut = fit < (int)para.length() && lastSpace > 0 ? lastSpace : fit;
+      out.push_back(para.substring(0, cut));
+      para = para.substring(cut);
+      para.trim();
+    }
+  }
+  while (out.size() && !out.back().length()) out.pop_back();
+}
+
+// Lignes de la réponse : la fin par défaut (la suite arrive en bas, comme un
+// terminal), plus haut si on a fait glisser le doigt dessus
+static void drawReply(int y, int maxLines) {
+  canvas.setFont(F_TEXT);
+  if (!reply.wrapped) {
+    wrapLines(reply.text, 292, reply.lines);
+    reply.wrapped = true;
+  }
+  int n = reply.lines.size();
+  // Lecture en cours plus haut : les nouvelles lignes ne la décalent pas
+  if (reply.scroll > 0) reply.scroll += n - reply.count;
+  reply.count = n;
+  reply.scroll = constrain(reply.scroll, 0, max(0, n - maxLines));
+
+  int first = max(0, n - maxLines - reply.scroll);
+  canvas.setTextDatum(top_left);
+  for (int i = first; i < min(n, first + maxLines); i++) {
+    const String& l = reply.lines[i];
+    canvas.setTextColor(l == "[code]" ? C_MUTED : C_TEXT);
+    canvas.drawString(l, 10, y + (i - first) * REPLY_LINE_H);
+  }
+
+  // Ascenseur à droite, seulement s'il y a de quoi défiler
+  if (n > maxLines) {
+    int h = maxLines * REPLY_LINE_H;
+    int barH = max(12, h * maxLines / n);
+    int barY = y + (h - barH) * first / (n - maxLines);
+    canvas.fillRoundRect(314, barY, 3, barH, 1, reply.scroll ? C_TEXT : C_DIM);
+  }
+}
+
+// Ajoute un paquet de lignes à la réponse : enlève le Markdown, remplace les
+// blocs de code par « [code] », ne garde que la fin.
+static void appendReply(const String& msgId, const String& delta) {
+  if (msgId != reply.msgId) {
+    reply.msgId = msgId;
+    reply.text = "";
+    reply.inFence = false;
+    reply.scroll = reply.count = 0;
+  }
+  int pos = 0, len = delta.length();
+  while (pos < len) {
+    int nl = delta.indexOf('\n', pos);
+    String line = delta.substring(pos, nl < 0 ? len : nl);
+    pos = nl < 0 ? len : nl + 1;
+    String t = line;
+    t.trim();
+    if (t.startsWith("```")) {
+      if (!reply.inFence) reply.text += "[code]\n";
+      reply.inFence = !reply.inFence;
+      continue;
+    }
+    if (reply.inFence || t.startsWith("|-") || t.startsWith("| -")) continue;
+    while (t.startsWith("#")) t.remove(0, 1);
+    if (t.startsWith("- ") || t.startsWith("* ")) t = "• " + t.substring(2);
+    t.replace("**", "");
+    t.replace("`", "");
+    t.trim();
+    reply.text += t + (nl < 0 ? "" : "\n");
+  }
+  if ((int)reply.text.length() > REPLY_MAX) {
+    int cut = reply.text.indexOf('\n', reply.text.length() - REPLY_MAX);
+    reply.text = reply.text.substring(cut < 0 ? reply.text.length() - REPLY_MAX : cut + 1);
+  }
+  reply.wrapped = false;
+  ui.dirty = true;
+}
+
+static bool replyOnScreen() {
+  return view == View::Live && ui.state != State::Waiting && reply.text.length();
+}
+
 static void drawBody(const Theme& t) {
   if (menuOnScreen()) return drawMenu(t);
 
@@ -397,6 +509,8 @@ static void drawBody(const Theme& t) {
   canvas.setTextColor(C_TEXT);
   canvas.drawString(fitText(ui.title, 300), 10, 78);
 
+  // Hors demande : la réponse de Claude plutôt que le détail des outils
+  if (replyOnScreen()) return drawReply(REPLY_Y, REPLY_LINES);
   if (!ui.detail.length()) return;
   bool code = ui.state == State::Working || ui.state == State::Waiting;
   canvas.setFont(F_TEXT);
@@ -701,7 +815,7 @@ static void trackSession(JsonDocument& doc, const String& ev, const String& tool
   Session* s = sessionFor(doc);
   if (!s) return;
   if (ev == "SessionStart") s->state = State::Idle;
-  else if (ev == "UserPromptSubmit" || ev == "PostToolUse") s->state = State::Thinking;
+  else if (ev == "UserPromptSubmit" || ev == "PostToolUse" || ev == "MessageDisplay") s->state = State::Thinking;
   else if (ev == "PermissionRequest") s->state = State::Waiting;
   else if (ev == "PreToolUse")
     s->state = tool == "AskUserQuestion" || tool == "ExitPlanMode" ? State::Waiting : State::Working;
@@ -717,7 +831,7 @@ static void handleUsage() {
     server.send(400, "text/plain", "bad json");
     return;
   }
-  server.send(200, "text/plain", "ok");
+  server.send(200);
   Session* s = findSession(doc["session_id"] | "");
   if (!s) s = sessionFor(doc);  // session déjà connue : on ne touche pas à `seen`
   if (!s) return;
@@ -733,59 +847,108 @@ static void handleUsage() {
   if (view == View::Usage) ui.dirty = true;
 }
 
-// Met la réponse de côté pour pad-prompt.py
-static void resolve(const char* decision, const String& summary) {
+// Décision au format attendu par Claude Code (sortie JSON d'un hook)
+static String hookOutput(const char* decision) {
   JsonDocument out;
-  out["decision"] = decision;
-  if (ask.kind == Ask::Question) {
-    JsonArray a = out["answers"].to<JsonArray>();
-    for (int i = 0; i < ask.qCount; i++) a.add(ask.answers[i]);
+  JsonObject h = out["hookSpecificOutput"].to<JsonObject>();
+  String ev = held.event["hook_event_name"] | "";
+  bool deny = strcmp(decision, "deny") == 0;
+  h["hookEventName"] = ev;
+  if (ev == "PermissionRequest") {
+    JsonObject d = h["decision"].to<JsonObject>();
+    d["behavior"] = deny ? "deny" : "allow";
+    if (deny) d["message"] = DENY_REASON;
+    if (strcmp(decision, "always") == 0) {
+      if (held.event["permission_suggestions"].size() > 0) {
+        d["updatedPermissions"] = held.event["permission_suggestions"];
+      } else if (isEditTool(held.event["tool_name"] | "")) {
+        // Pas de suggestion pour les modifs de fichiers : on accepte les
+        // modifications pour le reste de la session
+        JsonObject r = d["updatedPermissions"].to<JsonArray>().add<JsonObject>();
+        r["type"] = "setMode";
+        r["mode"] = "acceptEdits";
+        r["destination"] = "session";
+      }
+    }
+  } else {  // PreToolUse : AskUserQuestion, ExitPlanMode
+    h["permissionDecision"] = deny ? "deny" : "allow";
+    if (deny) {
+      h["permissionDecisionReason"] = DENY_REASON;
+    } else {
+      h["updatedInput"] = held.event["tool_input"];
+      if (ask.kind == Ask::Question) {
+        JsonObject a = h["updatedInput"]["answers"].to<JsonObject>();
+        for (int i = 0; i < ask.qCount; i++) a[String(ask.questions[i]["question"] | "")] = ask.answers[i];
+      }
+    }
   }
-  done.id = ask.id;
-  done.json = "";
-  serializeJson(out, done.json);
+  String json;
+  serializeJson(out, json);
+  return json;
+}
 
+// Répond au hook en attente et ferme la connexion. Corps vide : Claude Code
+// affiche son menu habituel.
+static void finishHeld(const String& body) {
+  if (!held.client) return;
+  held.client.print("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n"
+                    "Content-Length: " + String(body.length()) + "\r\n\r\n" + body);
+  held.client.stop();
+  held.client = WiFiClient();
+  held.event.clear();
+}
+
+static void resolve(const char* decision, const String& summary) {
+  finishHeld(hookOutput(decision));
   buzz(40);
   if (strcmp(decision, "deny") == 0) setState(State::Idle, "Refusé");
   else setState(State::Working, ask.kind == Ask::Permission ? "Accepté" : "Réponse envoyée", summary);
 }
 
-// POST /prompt?id=... : envoyé par pad-prompt.py, corps = JSON du hook
-static void handlePrompt() {
+// POST /hook : PermissionRequest, et PreToolUse pour AskUserQuestion /
+// ExitPlanMode. Pas de réponse ici : elle part au choix touché (resolve),
+// ou vide à l'abandon (délai, réponse donnée sur le PC).
+static void handleHook() {
   JsonDocument doc;
-  DeserializationError err = deserializeJson(doc, server.arg("plain"));
-  String id = server.arg("id");
-  if (err || !id.length()) {
-    server.send(400, "text/plain", "bad request");
+  if (deserializeJson(doc, server.arg("plain"))) {
+    server.send(400, "text/plain", "bad json");
     return;
   }
+  String ev = doc["hook_event_name"] | "";
+  String tool = doc["tool_name"] | "";
+  bool interactive = tool == "AskUserQuestion" || tool == "ExitPlanMode";
+  // Questions et plan passent par PreToolUse ; s'ils arrivent aussi en
+  // PermissionRequest (délai dépassé...), on laisse le menu du PC.
+  if (!(ev == "PermissionRequest" && !interactive) && !(ev == "PreToolUse" && interactive)) {
+    server.send(200);
+    return;
+  }
+
+  finishHeld("");  // une seule demande à la fois : la précédente retourne au PC
   wake();
   String cwd = doc["cwd"] | "";
   if (cwd.length()) ui.project = basename(cwd);
   Session* s = sessionFor(doc);
   if (s) s->state = State::Waiting;
-  openPrompt(doc, id);
-  server.send(200, "text/plain", "ok");
+  openPrompt(doc, String(++promptSeq));
+  held.client = server.client();  // garde la connexion ouverte
+  held.event = doc;
+  held.since = millis();
 }
 
-// GET /answer?id=... : 202 tant qu'on attend, 200 + JSON une fois choisi,
-// 410 si la demande n'est plus à l'écran (répondue sur le PC, remplacée...)
-static void handleAnswer() {
-  String id = server.arg("id");
-  if (id.length() && id == done.id) {
-    server.send(200, "application/json", done.json);
-  } else if (id.length() && id == ask.id && ui.state == State::Waiting) {
-    server.send(202, "text/plain", "pending");
-  } else {
-    server.send(410, "text/plain", "gone");
-  }
-}
-
-// POST /cancel?id=... : le script abandonne (délai dépassé)
-static void handleCancel() {
-  if (server.arg("id") == ask.id && ui.state == State::Waiting)
-    setState(State::Idle, "Délai dépassé", "Réponds sur le PC.");
-  server.send(200, "text/plain", "ok");
+// Demande en attente abandonnée par Claude Code (réponse donnée sur le PC,
+// session arrêtée) ou trop longue : retour au menu du PC
+static void checkHeld() {
+  if (!held.client) return;
+  static uint32_t last = 0;
+  if (millis() - last < 300) return;
+  last = millis();
+  bool gone = !held.client.connected();
+  bool late = millis() - held.since > PROMPT_TIMEOUT_MS;
+  if (!gone && !late) return;
+  finishHeld("");
+  if (ui.state == State::Waiting && ask.id.length())
+    setState(State::Idle, late ? "Délai dépassé" : "Répondu sur le PC", late ? "Réponds sur le PC." : "");
 }
 
 static void handleEvent() {
@@ -795,14 +958,26 @@ static void handleEvent() {
     server.send(400, "text/plain", String("bad json: ") + err.c_str());
     return;
   }
-  server.send(200, "text/plain", "ok");
+  server.send(200);  // corps vide : succès pour un hook http
 
   String ev = doc["hook_event_name"] | "";
   String tool = doc["tool_name"] | "";
   trackSession(doc, ev, tool);
   if (ev == "SessionEnd") return;
 
-  // Les demandes passent par /prompt (pad-prompt.py), pas par ici
+  // Réponse de Claude, ligne par ligne
+  if (ev == "MessageDisplay") {
+    appendReply(doc["message_id"] | "", doc["delta"] | "");
+    wake();
+    if (ui.state != State::Waiting) {
+      String cwd = doc["cwd"] | "";
+      if (cwd.length()) ui.project = basename(cwd);
+      setState(State::Thinking, "Claude répond");
+    }
+    return;
+  }
+
+  // Les demandes passent par /hook, pas par ici
   if (ev == "PermissionRequest") return;
   if (ev == "PreToolUse" && (tool == "AskUserQuestion" || tool == "ExitPlanMode")) return;
 
@@ -828,13 +1003,14 @@ static void handleEvent() {
     setState(State::Idle, "Session démarrée");
   } else if (ev == "UserPromptSubmit") {
     String prompt = doc["prompt"] | "";
+    reply = Reply();  // nouveau tour : la réponse précédente s'efface
     setState(State::Thinking, "Claude réfléchit...", prompt);
   } else if (ev == "PostToolUse") {
     setState(State::Thinking, "Claude réfléchit...");
   } else if (ev == "PreToolUse") {
     lastTool = tool;
     lastWhat = firstOf(doc["tool_input"], {"command", "file_path", "pattern", "url", "description"});
-    setState(State::Working, tool, lastWhat);
+    setState(State::Working, tool);  // pas de code à l'écran : la réponse reste affichée
   } else if (ev == "Notification") {
     String type = doc["notification_type"] | "";
     String msg = doc["message"] | "Claude a besoin de toi";
@@ -842,7 +1018,7 @@ static void handleEvent() {
       setState(State::Done, "Claude attend ton message", msg);
       buzz(120);
     } else {
-      // Demande sans pad-prompt.py (ou délai dépassé) : réponse sur le PC
+      // Demande sans hook /hook (ou délai dépassé) : réponse sur le PC
       ask.kind = Ask::Other;
       setState(State::Waiting, "Réponds sur le PC", msg);
       alertWaiting();
@@ -926,6 +1102,22 @@ static void showView(View v) {
 // A = Sessions, B = Conso, C = Direct, inactives quand un menu est affiché.
 static void handleTouch() {
   auto touch = M5.Touch.getDetail();
+
+  // Glisser le doigt sur la réponse : la fait défiler (vers le bas = plus ancien)
+  static int drag = 0;
+  if (touch.isDragging() && !dimmed && replyOnScreen() && touch.y >= REPLY_Y - 4 && touch.y < 240) {
+    drag += touch.deltaY();
+    int lines = drag / REPLY_LINE_H;
+    if (lines) {
+      drag -= lines * REPLY_LINE_H;
+      int before = reply.scroll;
+      reply.scroll = max(0, reply.scroll + lines);  // plafonné au dessin
+      if (reply.scroll != before) ui.dirty = true;
+    }
+    lastActivity = millis();
+    return;
+  }
+  if (!touch.isPressed()) drag = 0;
   if (!touch.wasPressed()) return;
 
   // Écran en veille : le premier appui ne fait que le réveiller
@@ -1155,9 +1347,7 @@ void setup() {
 
   server.on("/", HTTP_GET, handleRoot);
   server.on("/event", HTTP_POST, handleEvent);
-  server.on("/prompt", HTTP_POST, handlePrompt);
-  server.on("/answer", HTTP_GET, handleAnswer);
-  server.on("/cancel", HTTP_POST, handleCancel);
+  server.on("/hook", HTTP_POST, handleHook);
   server.on("/usage", HTTP_POST, handleUsage);
   server.begin();
 
@@ -1179,6 +1369,7 @@ void loop() {
 
   M5.update();
   server.handleClient();
+  checkHeld();
   handleTouch();
 
   uint32_t now = millis();
@@ -1222,7 +1413,7 @@ void loop() {
     ui.dirty = true;
   }
 
-  // ~15 images/s pour les animations, 1/s sinon (chrono)
+  // ~15 images/s pour les animations, 1/s sinon (batterie, Wi-Fi, âge des sessions)
   static uint32_t lastFrame = 0;
   uint32_t period = view == View::Live && animated(ui.state) && !dimmed ? 66 : 1000;
   if (ui.dirty || now - lastFrame >= period) {

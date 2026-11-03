@@ -1,7 +1,9 @@
 # Claude Pad — M5Stack Core2
 
 Petit pad posé à côté du clavier :
-- affiche ce que fait Claude Code (réflexion, outil en cours, terminé) ;
+- affiche ce que fait Claude Code (réflexion, outil en cours, terminé) et
+  **sa réponse en direct**, au fil de l'écriture (sans les blocs de code ni
+  le détail des commandes) ;
 - **vibre et bipe** quand Claude attend ta réponse (rappel toutes les 30 s) ;
 - **répond depuis l'écran tactile** aux demandes de Claude : permission
   (Oui / Oui, ne plus demander / Non), question à choix (simple ou multiple),
@@ -27,10 +29,10 @@ flowchart LR
   subgraph PC["Mac / Linux / Windows"]
     CC["Claude Code<br/>terminal · app · IDE<br/>(une ou plusieurs sessions)"]
     T[("transcript .jsonl")]
-    subgraph H["client/ : hooks (~/.claude/settings.json)"]
-      E["pad-event.py<br/>tous les événements"]
-      P["pad-prompt.py<br/>PermissionRequest,<br/>AskUserQuestion, ExitPlanMode"]
-      U["pad-usage.py<br/>PostToolUse, Stop<br/>(en arrière-plan)"]
+    subgraph H["hooks (~/.claude/settings.json)"]
+      E["http → /event<br/>tous les événements,<br/>réponse (MessageDisplay)"]
+      P["http → /hook<br/>PermissionRequest,<br/>AskUserQuestion, ExitPlanMode"]
+      U["client/pad-usage.py<br/>PostToolUse, Stop<br/>(async)"]
     end
     CC --> E & P & U
     CC -.écrit.-> T
@@ -47,10 +49,9 @@ flowchart LR
   end
 
   E -- "POST /event" --> W
-  P -- "POST /prompt" --> W
-  P -- "GET /answer (attente)" --> W
+  P -- "POST /hook (connexion gardée ouverte)" --> W
   U -- "POST /usage" --> W
-  P -. "décision / réponses" .-> CC
+  W -. "décision / réponses" .-> CC
 ```
 
 Une demande de Claude, de bout en bout :
@@ -58,29 +59,23 @@ Une demande de Claude, de bout en bout :
 ```mermaid
 sequenceDiagram
   participant CC as Claude Code
-  participant P as pad-prompt.py
   participant Pad as Core2
   actor Toi
-  CC->>P: hook (JSON : outil, question, plan...)
-  P->>Pad: POST /prompt?id=...
+  CC->>Pad: hook http : POST /hook (JSON : outil, question, plan...)
   Pad-->>Toi: vibre, bipe, affiche les choix
-  loop toutes les 0,3 s (90 s max)
-    P->>Pad: GET /answer?id=...
-    Pad-->>P: 202 en attente
-  end
+  Note over CC,Pad: la connexion reste ouverte (90 s max)
   Toi->>Pad: touche un choix
-  P->>Pad: GET /answer?id=...
-  Pad-->>P: 200 {"decision": "allow", "answers": [...]}
-  P-->>CC: allow / deny / réponses
-  Note over P,CC: sans réponse : POST /cancel,<br/>le menu du PC reprend la main
+  Pad-->>CC: 200 {"hookSpecificOutput": allow / deny / réponses}
+  Note over CC,Pad: sans réponse, ou réponse donnée sur le PC :<br/>corps vide, le menu du PC reprend la main
 ```
 
-Le script de hook `pad-prompt.py` attend le choix fait sur le pad et le
-renvoie directement à Claude Code (décision `allow` / `deny`, règle
-« ne plus demander », réponses aux questions). Pas de clavier simulé :
-ça marche dans le terminal comme dans l'app de bureau, quelle que soit la
-fenêtre au premier plan. Pad éteint, délai dépassé (90 s) ou réponse donnée
-sur le PC : le menu habituel de Claude Code reprend la main.
+Claude Code envoie lui-même les événements au pad (hooks `http`) : rien à
+lancer sur le PC. Pour une demande, le pad garde la connexion ouverte et
+répond directement avec la décision (`allow` / `deny`, règle « ne plus
+demander », réponses aux questions). Pas de clavier simulé : ça marche dans
+le terminal comme dans l'app de bureau, quelle que soit la fenêtre au premier
+plan. Pad éteint, délai dépassé (90 s) ou réponse donnée sur le PC : le menu
+habituel de Claude Code reprend la main.
 
 ## 1. Flasher le pad (`server/`)
 
@@ -113,9 +108,9 @@ changer le nom mDNS.
 
 ## 2. Brancher Claude Code (`client/`)
 
-Il faut Python 3 sur la machine (déjà là sur macOS et Linux ; sous Windows,
-python.org ou Microsoft Store) et le même réseau que le pad. Puis, sur
-chaque machine :
+Sur chaque machine, sur le même réseau que le pad. Il faut Python 3 pour
+l'installeur et pour la vue Conso (déjà là sur macOS et Linux ; sous
+Windows, python.org ou Microsoft Store) :
 
 ```bash
 python3 client/install.py 192.168.1.169   # macOS / Linux (ou ./client/install.sh)
@@ -128,24 +123,32 @@ plutôt l'IP : la résolution `.local` n'y est pas toujours fiable.
 
 Le script ajoute les hooks du pad dans `~/.claude/settings.json` sans toucher
 au reste (sauvegarde en `.bak`) ; le relancer remplace l'adresse, et il
-remplace aussi les anciens hooks `curl`. Il écrit le chemin exact de Python
-et des scripts, avec l'adresse en argument (`--pad`) : pas de `curl` ni de
-variable d'environnement dans les commandes, elles marchent quel que soit le
-shell (bash, zsh, cmd, PowerShell, Git Bash). À la main : fusionne
-`client/settings.json` en adaptant les chemins et l'adresse.
+remplace aussi les anciens hooks (scripts `pad-event.py` / `pad-prompt.py`,
+`curl`). À la main : fusionne `client/settings.json` en adaptant l'adresse et
+le chemin de `pad-usage.py`.
 
 Les hooks :
-- `pad-event.py` (tous les événements) transmet l'activité pour l'affichage.
-  Il abandonne au bout de 1 s : Claude n'est jamais bloqué si le pad est éteint.
-- `pad-prompt.py` (`PermissionRequest`, et `PreToolUse` pour
-  `AskUserQuestion|ExitPlanMode`) attend le choix fait sur le pad, avec un
-  `timeout` de 120 s (le script rend la main à 90 s, `CLAUDE_PAD_TIMEOUT`
-  pour changer).
-- `pad-usage.py` (`PostToolUse`, `Stop`) relit le transcript de la session et
-  envoie au pad le contexte occupé, les tokens cumulés (sous-agents compris)
-  et le prix au tarif de l'API Anthropic. Il se relance en arrière-plan et
-  rend la main tout de suite.
+- **http → `/event`** (tous les événements) : l'activité pour l'affichage.
+  Délai de 2 s : pad éteint, Claude n'est jamais bloqué (un hook http en
+  échec ne bloque rien).
+- **http → `/event` sur `MessageDisplay`** : la réponse de Claude, envoyée
+  par paquets de lignes pendant qu'elle s'affiche. Le pad en montre la fin,
+  sans Markdown ; les blocs de code deviennent « [code] ». Claude Code attend
+  ce hook avant d'afficher chaque paquet : délai de 1 s, pour qu'un pad éteint
+  ne ralentisse pas trop l'affichage (retire ce hook si le pad est souvent
+  éteint).
+- **http → `/hook`** (`PermissionRequest`, et `PreToolUse` pour
+  `AskUserQuestion|ExitPlanMode`) : le pad attend le choix fait à l'écran et
+  renvoie la décision. `timeout` de 120 s ; le pad rend la main à 90 s.
+- **`pad-usage.py`** (`PostToolUse`, `Stop`, en `async`) relit le transcript
+  de la session et envoie au pad le contexte occupé, les tokens cumulés
+  (sous-agents compris) et le prix au tarif de l'API Anthropic. C'est le seul
+  script : le pad ne peut pas lire le transcript. Sans Python, seule la vue
+  Conso reste vide.
 - `SessionEnd` retire la session de la liste.
+
+Sans installeur (pas de Python), colle dans `~/.claude/settings.json` les
+hooks `http` de `client/settings.json` en remplaçant l'adresse.
 
 Test sans Claude :
 ```bash
@@ -167,13 +170,19 @@ curl -X POST http://claude-pad.local/event -H 'Content-Type: application/json' \
   demande depuis le pad arrête l'action en cours.
 - Une seule demande à la fois pour toutes les sessions : la dernière gagne
   (la précédente retombe sur le menu du PC).
+- Les hooks `http` et `MessageDisplay` demandent une version récente de
+  Claude Code.
+- Le pad montre la réponse de la dernière session active : deux sessions qui
+  répondent en même temps s'alternent à l'écran.
+- Pendant une demande de permission, la commande reste affichée : c'est ce
+  qu'on autorise.
 - Le prix est un **équivalent API** (tarifs codés dans `pad-usage.py`) : avec
   un abonnement Pro / Max, ce n'est pas ce que tu paies. Le contexte suppose
   une fenêtre de 1 M tokens (200 k pour Haiku 4.5).
 - Le pad oublie les sessions au redémarrage, et celles sans nouvelles depuis 12 h.
 - Questions : 4 au maximum, 4 options chacune (la réponse libre « Other »
   n'est pas proposée sur le pad).
-- Pas d'authentification sur `/event`, `/prompt`, `/answer` : à garder sur un
+- Pas d'authentification sur `/event`, `/hook`, `/usage` : à garder sur un
   réseau local de confiance. Le point d'accès de réglage est ouvert (sans mot
   de passe) le temps du réglage.
 - Le pad ne rejoint que les réseaux 2,4 GHz (limite de l'ESP32).
