@@ -52,11 +52,6 @@
             "type": "http",
             "url": "http://claude-pad.local/event",
             "timeout": 2
-          },
-          {
-            "type": "command",
-            "async": true,
-            "command": "python3 /chemin/vers/claude-pad/client/pad-usage.py --pad http://claude-pad.local"
           }
         ]
       }
@@ -91,11 +86,6 @@
             "type": "http",
             "url": "http://claude-pad.local/event",
             "timeout": 2
-          },
-          {
-            "type": "command",
-            "async": true,
-            "command": "python3 /chemin/vers/claude-pad/client/pad-usage.py --pad http://claude-pad.local"
           }
         ]
       }
@@ -122,5 +112,9 @@
         ]
       }
     ]
+  },
+  "statusLine": {
+    "type": "command",
+    "command": "curl -s --connect-timeout 1 -m 2 -X POST -H \"Content-Type: application/json\" --data-binary @- http://claude-pad.local/usage"
   }
 }

@@ -8,15 +8,12 @@
 <h2>Vue d'ensemble</h2><pre class="mermaid">flowchart LR
   subgraph PC[&quot;Mac / Linux / Windows&quot;]
     CC[&quot;Claude Code&lt;br/&gt;terminal · app · IDE&lt;br/&gt;(une ou plusieurs sessions)&quot;]
-    T[(&quot;transcript .jsonl&quot;)]
     subgraph H[&quot;hooks (~/.claude/settings.json)&quot;]
       E[&quot;http → /event&lt;br/&gt;tous les événements,&lt;br/&gt;réponse (MessageDisplay)&quot;]
       P[&quot;http → /hook&lt;br/&gt;PermissionRequest,&lt;br/&gt;AskUserQuestion, ExitPlanMode&quot;]
-      U[&quot;client/pad-usage.py&lt;br/&gt;PostToolUse, Stop&lt;br/&gt;(async)&quot;]
+      U[&quot;statusLine&lt;br/&gt;curl → /usage&quot;]
     end
     CC --&gt; E &amp; P &amp; U
-    CC -.écrit.-&gt; T
-    T -.lu par.-&gt; U
   end
 
   subgraph PAD[&quot;server/ : M5Stack Core2 (Wi-Fi, port 80)&quot;]
