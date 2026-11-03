@@ -6,7 +6,10 @@
     (Windows : py install.py 192.168.1.169)
 
 Ajoute les hooks du pad dans ~/.claude/settings.json (CLAUDE_SETTINGS pour
-un autre fichier) sans toucher au reste. Relancer le script remplace les
+un autre fichier) sans toucher au reste :
+  - hooks http : Claude Code envoie lui-même les événements et les demandes
+    au pad (rien à lancer) ;
+  - pad-usage.py, en arrière-plan, pour la conso (il lit le transcript). Relancer le script remplace les
 hooks du pad déjà présents : pratique pour changer d'adresse.
 Une copie de sauvegarde est faite à côté (settings.json.bak).
 """
@@ -20,7 +23,7 @@ import sys
 import urllib.request
 
 HERE = pathlib.Path(__file__).resolve().parent
-SCRIPTS = ("pad-event.py", "pad-prompt.py", "pad-usage.py")
+SCRIPTS = ("pad-event.py", "pad-prompt.py", "pad-usage.py")  # dont anciennes versions
 
 
 def python():
@@ -44,7 +47,9 @@ def quote(arg):
 
 
 def is_ours(hook):
-    """Hook du pad, y compris les anciennes versions (curl ... /event)."""
+    """Hook du pad, y compris les anciennes versions (scripts, curl ... /event)."""
+    if hook.get("type") == "http":
+        return hook.get("url", "").endswith(("/event", "/hook"))
     c = hook.get("command", "")
     return any(s in c for s in SCRIPTS) or ("curl" in c and "/event" in c)
 
@@ -63,14 +68,16 @@ def remove_ours(hooks):
 
 
 def add_ours(hooks, pad):
-    def cmd(script, timeout=None):
-        h = {"type": "command",
-             "command": " ".join(quote(a) for a in (python(), str(HERE / script), "--pad", pad))}
-        if timeout:
-            h["timeout"] = timeout
-        return h
-
-    event, prompt, usage = cmd("pad-event.py"), cmd("pad-prompt.py", 120), cmd("pad-usage.py")
+    # Pad éteint : un hook http en échec ne bloque pas Claude (onFailure
+    # « continue » par défaut). Délai court pour l'affichage ; pour une
+    # demande, le pad rend la main de lui-même au bout de 90 s.
+    event = {"type": "http", "url": pad + "/event", "timeout": 2}
+    # Réponse de Claude en direct : Claude Code attend ce hook avant
+    # d'afficher chaque paquet de lignes, d'où le délai le plus court
+    stream = {"type": "http", "url": pad + "/event", "timeout": 1}
+    prompt = {"type": "http", "url": pad + "/hook", "timeout": 120}
+    usage = {"type": "command", "async": True,
+             "command": " ".join(quote(a) for a in (python(), str(HERE / "pad-usage.py"), "--pad", pad))}
     add = {
         "SessionStart":      [{"hooks": [event]}],
         "UserPromptSubmit":  [{"hooks": [event]}],
@@ -81,6 +88,7 @@ def add_ours(hooks, pad):
         "Notification":      [{"hooks": [event]}],
         "Stop":              [{"hooks": [event, usage]}],
         "SessionEnd":        [{"hooks": [event]}],
+        "MessageDisplay":    [{"hooks": [stream]}],
     }
     for name, entries in add.items():
         hooks.setdefault(name, []).extend(entries)
@@ -119,8 +127,7 @@ def main():
     path.write_text(json.dumps(settings, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
     if os.name != "nt":
-        for s in SCRIPTS:
-            (HERE / s).chmod(0o755)
+        (HERE / "pad-usage.py").chmod(0o755)
     print(f"Hooks du pad {'retirés de' if uninstall else 'installés dans'} {path}{backup}.")
 
 
